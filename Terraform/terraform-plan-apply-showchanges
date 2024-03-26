@@ -1,0 +1,291 @@
+name: "Terraform CM"
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "projects/**"
+      - "tfenvs/**"
+      - "modules/**"
+
+env:
+  TF_LOG: INFO
+  GOOGLE_CREDENTIALS: ${{ secrets.TERRAFORM_GOOGLE_CREDENTIALS }}
+  TF_IN_AUTOMATION: "true"
+  TF_VAR_ARGOCD_TOKEN_DEV: ${{secrets.TF_VAR_ARGOCD_TOKEN_DEV}}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  id-token: write
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  get_envs:
+    runs-on: ubuntu-latest
+    outputs:
+      envs: ${{ steps.find_env_files.outputs.envs }}
+    steps:
+      - name: 👨🏻‍💻 Repository checkout.
+        uses: actions/checkout@main
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+
+      - name: find envs
+        id: find_env_files
+        run: |
+          echo "envs=$(ls -1 tfenvs/ |awk -F. '{print $1}' | jq -R -s -c 'split("\n")[:-1]')" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+  terraform_plan:
+    name: "Terraform Plan"
+    runs-on: ubuntu-latest
+    needs:
+      - get_envs
+    outputs:
+      outcome: ${{ steps.plan.outcome }}
+    strategy:
+      matrix:
+        env: ${{ fromJson(needs.get_envs.outputs.envs) }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: projects
+    env:
+      TF_WORKSPACE: ${{ matrix.env }}
+
+    steps:
+      - name: 👨🏻‍💻 Repository checkout.
+        uses: actions/checkout@main
+
+      - name: Install tfenv
+        run: |
+          git clone https://github.com/tfutils/tfenv.git ~/.tfenv
+          echo "$HOME/.tfenv/bin" >> $GITHUB_PATH
+
+      - name: Install Terraform
+        run: |
+          tfenv install
+          terraform --version
+
+      - name: Terraform Fmt
+        id: fmt
+        run: terraform fmt -check -diff
+        continue-on-error: true
+
+      - name: Terraform init
+        id: init
+        run: terraform init
+
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate -no-color | sed -E 's/^([[:space:]]+)([-+])/\2\1/g'
+        continue-on-error: true
+
+      - name: Terraform workspace
+        id: workspace
+        run: terraform workspace show
+        continue-on-error: true
+
+      - name: Plan Terraform
+        id: plan
+        continue-on-error: true
+        run: |
+          terraform plan -input=false -detailed-exitcode -no-color -var-file=../tfenvs/${{matrix.env}}.tfvars > tfplan.txt 2>&1
+
+      - name: Reformat Plan
+        run: |
+          cat tfplan.txt | sed -E 's/^([[:space:]]+)([-+])/\2\1/g' > plan.txt
+
+      - name: Check for Changes
+        id: check_changes
+        run: |
+          mkdir -p outputs
+          plan_output=$(cat plan.txt)
+
+          if grep -q "No changes" <<< "$plan_output"; then
+            echo "No changes detected. Skipping output file creation."
+            echo "skip=true" >> GITHUB_OUTPUT
+            # echo "{}" > outputs/${{ matrix.env }}.json
+            echo "{\"apply\":[]}" > outputs/${{ matrix.env }}.json
+          else
+            echo "skip=false" >> GITHUB_OUTPUT
+            echo "{\"apply\":[\"${{ matrix.env }}\"]}" > outputs/${{ matrix.env }}.json
+          fi
+
+      # Create string output of Terraform Plan
+      - name: Create String Output
+        id: tf-plan-string
+        if: steps.check_changes.outputs.skip
+        run: |
+          TERRAFORM_PLAN=$(cat plan.txt)
+
+          delimiter="$(openssl rand -hex 8)"
+          echo "summary<<${delimiter}" >> $GITHUB_OUTPUT
+          echo "## Terraform ${{matrix.env}} Plan Output" >> $GITHUB_OUTPUT
+          echo "<details><summary>Click to expand</summary>" >> $GITHUB_OUTPUT
+          echo "" >> $GITHUB_OUTPUT
+          echo '```terraform' >> $GITHUB_OUTPUT
+          echo "$TERRAFORM_PLAN" >> $GITHUB_OUTPUT
+          echo '```' >> $GITHUB_OUTPUT
+          echo "</details>" >> $GITHUB_OUTPUT
+          echo "${delimiter}" >> $GITHUB_OUTPUT
+
+      # Publish Terraform Plan as task summary
+      - name: Publish Terraform Plan to Task Summary
+        if: steps.check_changes.outputs.skip
+        env:
+          SUMMARY: ${{ steps.tf-plan-string.outputs.summary }}
+        run: |
+          echo "$SUMMARY" >> $GITHUB_STEP_SUMMARY
+
+      - name: Put Plan in Env Var
+        run: |
+          PLAN=$(cat plan.txt)
+          echo "PLAN<<EOF" >> $GITHUB_ENV
+          echo "$PLAN" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Upload outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: outputs-${{ matrix.env }}
+          path: projects/outputs/*
+
+      - uses: actions/github-script@v6
+        if: (github.event_name == 'pull_request') && (steps.check_changes.outputs.skip)
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            // 1. Retrieve existing bot comments for the PR
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            })
+            const botComment = comments.find(comment => {
+              return comment.user.type === 'Bot' && comment.body.includes('Terraform Format and Style') && comment.body.includes('Terraform Env 🤖\`${{ matrix.env }}\`')
+            })
+
+            // 2. Prepare format of the comment
+            const output = `#### Terraform Env 🤖\`${{ matrix.env }}\`
+            #### Terraform Format and Style 🖌\`${{ steps.fmt.outcome }}\`
+            #### Terraform Initialization ⚙️\`${{ steps.init.outcome }}\`
+            #### Terraform Validation 🤖\`${{ steps.validate.outcome }}\`
+            <details><summary>Validation Output</summary>
+
+            \`\`\`\n
+            ${{ steps.validate.outputs.stdout }}
+            \`\`\`
+
+            </details>
+
+            #### Terraform Plan 📖\`${{ steps.plan.outcome }}\`
+
+            <details><summary>Show Plan</summary>
+
+            \`\`\`\n
+            ${{env.PLAN}}
+            \`\`\`
+
+            </details>
+
+            *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`, Working Directory: \`${{ env.tf_actions_working_dir }}\`, Workflow: \`${{ github.workflow }}\`*`;
+
+            // 3. If we have a comment, update it, otherwise create a new one
+            if (botComment) {
+              github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: output
+              })
+            } else {
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: output
+              })
+            }
+
+      - name: Check for Plan Failure
+        if: steps.plan.outputs.exitcode == 1
+        run: exit 1
+
+  find_changes:
+    if: always() && (needs.terraform_plan.result == 'success')
+    name: "Find changes"
+    runs-on: ubuntu-latest
+    needs:
+      - terraform_plan
+    outputs:
+      apply_envs: "${{ env.apply_envs }}"
+    steps:
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - run: |
+          jq -s '{apply: map(.apply) | add}' *.json > merged.json
+
+          echo "cat merged.json"
+          cat merged.json
+          echo
+          echo
+          cat merged.json | jq -r .apply | tr -d '\n' | tr -d ' ' > apply_to.txt
+          echo
+          echo
+          echo "cat apply_to.txt"
+          cat apply_to.txt
+
+      - name: create new matrix
+        id: apply_to
+        run: |
+          echo "apply_envs=$(cat apply_to.txt)" >> $GITHUB_ENV
+
+  terraform_apply:
+    if: always() && (github.ref == 'refs/heads/main') && (github.event_name == 'push') && (needs.terraform_plan.result == 'success') && (needs.find_changes.outputs.apply_envs != '[]')
+    name: "Terraform apply"
+    runs-on: ubuntu-latest
+    needs:
+      - terraform_plan
+      - find_changes
+    environment: ${{ matrix.env }}
+    strategy:
+      matrix:
+        env: ${{ fromJson(needs.find_changes.outputs.apply_envs) }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: projects
+    env:
+      TF_WORKSPACE: ${{ matrix.env }}
+
+    steps:
+      - name: 👨🏻‍💻 Repository checkout.
+        uses: actions/checkout@main
+
+      - name: Install tfenv
+        run: |
+          git clone https://github.com/tfutils/tfenv.git ~/.tfenv
+          echo "$HOME/.tfenv/bin" >> $GITHUB_PATH
+
+      - name: Install Terraform
+        run: |
+          tfenv install
+          terraform --version
+
+      - name: Terraform init
+        id: init
+        run: terraform init
+
+      - name: Terraform Apply
+        run: |
+          terraform apply -auto-approve -input=false -var-file=../tfenvs/${{matrix.env}}.tfvars
+
